@@ -6,7 +6,7 @@ r"""程序运行计时器 —— 记录每个 .exe 从启动到关闭的时长�
     1. 你给出一个 .exe 路径；
     2. 脚本立即启动它，并开始计时；
     3. 该进程退出（你关掉程序）时停表；
-    4. 把本次用时追加到 运行计时记录.txt，并算出该程序与全部的累计时长；
+    4. 把本次用时更新到 运行计时记录.txt（同一个程序只占一条记录）；
     5. 默认用记事本打开记录文件。
 
 交互提示符参数用法
@@ -27,11 +27,9 @@ r"""程序运行计时器 —— 记录每个 .exe 从启动到关闭的时长�
     -h, --help          显示帮助
 
 记录文件
-    文件名固定为 运行计时记录.txt，每次运行追加一段：
-        记录 #N   开始时间 → 结束时间
-        程序 / 路径 / 用时 / 退出码
-        该程序累计 / 全部累计
-    累计与“记住上次程序”都来自这个文件；换 -d 等于换一本账，删掉等于清空历史。
+    文件名固定为 运行计时记录.txt，按程序汇总：同一个 .exe 只有一条，每次运行更新它。
+        程序 / 路径 / 次数 / 累计时长 / 首次 / 最近 / 最近的单次用时
+    多个程序按累计时长从多到少排列；换 -d 等于换一本账，删掉等于清空历史。
 
 退出码
     0 正常结束   1 启动失败   2 路径无效 / 没有读到输入   130 手动中断
@@ -101,14 +99,18 @@ def normalize_exit_code(code: int) -> int:
 
 # ---------------------------------------------------------------- 记录的读写
 
-def load_history(record: Path) -> list[dict]:
-    """从已有记录里还原历次用时；文件被手动改过也只跳过读不懂的行。"""
+def load_entries(record: Path) -> dict[str, dict]:
+    """读回“按程序汇总”的记录；读不懂的行直接跳过，不影响其它条目。"""
     if not record.exists():
-        return []
+        return {}
 
     text = record.read_text(encoding="utf-8-sig", errors="replace")
-    records: list[dict] = []
+    entries: dict[str, dict] = {}
     current: dict | None = None
+
+    def store(entry: dict | None) -> None:
+        if entry and entry["path"]:
+            entries[entry["path"].lower()] = entry
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -116,62 +118,113 @@ def load_history(record: Path) -> list[dict]:
             continue
 
         if line.startswith("程序") and ":" in line:
-            current = {"path": "", "seconds": 0.0}
+            store(current)
+            current = {
+                "name": line.split(":", 1)[1].strip(),
+                "path": "",
+                "count": 0,
+                "seconds": 0.0,
+                "first": None,
+                "last": None,
+            }
         elif current is None:
             continue
         elif line.startswith("路径") and ":" in line:
             current["path"] = line.split(":", 1)[1].strip()
-        elif line.startswith("用时"):
+        elif line.startswith("次数") and ":" in line:
+            match = re.search(r"(\d+)", line)
+            current["count"] = int(match.group(1)) if match else 0
+        elif line.startswith("累计") and ":" in line:
             match = re.search(r"（([\d.]+) 秒）", line)
-            if match:
-                current["seconds"] = float(match.group(1))
-        elif line.startswith("退出码"):
-            records.append(current)
-            current = None
+            current["seconds"] = float(match.group(1)) if match else 0.0
+        elif line.startswith("首次") and ":" in line:
+            current["first"] = parse_time(line.split(":", 1)[1].strip())
+        elif line.startswith("最近") and ":" in line:
+            current["last"] = parse_time(line.split(":", 1)[1].strip())
 
-    return records
+    store(current)
+    return entries
 
 
-def append_record(
-    record: Path,
+def parse_time(text: str) -> datetime | None:
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def last_used(entries: dict[str, dict]) -> Path | None:
+    """最近一次计时过的程序，用于“直接回车复用”。"""
+    if not entries:
+        return None
+    newest = max(entries.values(), key=lambda item: item["last"] or datetime.min)
+    return Path(newest["path"]) if newest["path"] else None
+
+
+def render_entries(entries: dict[str, dict]) -> str:
+    """按累计时长从多到少，生成整份记录文本。"""
+    items = sorted(entries.values(), key=lambda item: item["seconds"], reverse=True)
+    total = sum(item["seconds"] for item in items)
+    lines = [
+        "程序运行计时记录（按程序汇总：同一个 .exe 只有一条，每次运行更新它）",
+        f"更新于 {datetime.now():%Y-%m-%d %H:%M:%S}"
+        f"    共 {len(items)} 个程序，总计 {duration_text(total)}",
+    ]
+
+    for item in items:
+        first = item["first"] or item["last"]
+        last = item["last"] or item["first"]
+
+        lines.extend(
+            [
+                "",
+                SEPARATOR,
+                f"程序      : {item['name']}",
+                f"路径      : {item['path']}",
+                f"次数      : {item['count']} 次",
+                f"累计      : {duration_text(item['seconds'])}（{item['seconds']:.1f} 秒）",
+                f"首次      : {first:%Y-%m-%d %H:%M:%S}" if first else "首次      : -",
+                f"最近      : {last:%Y-%m-%d %H:%M:%S}" if last else "最近      : -",
+            ]
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def record_run(
+    entries: dict[str, dict],
     exe: Path,
     started: datetime,
     ended: datetime,
     seconds: float,
-    exit_code: int,
-    history: list[dict],
-) -> tuple[int, float, int, float]:
-    """把这次运行追加到记录文件末尾，返回 (该程序次数, 该程序累计秒, 总次数, 总累计秒)。"""
+) -> dict:
+    """把这次用时并进对应程序那一条，返回更新后的条目。"""
     key = str(exe).lower()
-    same = [item for item in history if item["path"].lower() == key]
+    entry = entries.get(key)
+    if entry is None:
+        entry = {
+            "name": exe.name,
+            "path": str(exe),
+            "count": 0,
+            "seconds": 0.0,
+            "first": started,
+            "last": ended,
+        }
+        entries[key] = entry
 
-    same_count = len(same) + 1
-    same_total = sum(item["seconds"] for item in same) + seconds
-    all_count = len(history) + 1
-    all_total = sum(item["seconds"] for item in history) + seconds
+    entry["count"] += 1
+    entry["seconds"] += seconds
+    entry["first"] = entry["first"] or started
+    entry["last"] = ended
+    return entry
 
-    if not record.exists():
-        record.parent.mkdir(parents=True, exist_ok=True)
-        record.write_text(
-            "程序运行计时记录（每次运行都会追加到本文件）\n"
-            f"创建于 {datetime.now():%Y-%m-%d %H:%M:%S}\n",
-            encoding="utf-8-sig",
-        )
 
-    block = (
-        f"\n{SEPARATOR}\n"
-        f"记录 #{all_count}    {started:%Y-%m-%d %H:%M:%S} → {ended:%Y-%m-%d %H:%M:%S}\n"
-        f"程序      : {exe.name}\n"
-        f"路径      : {exe}\n"
-        f"用时      : {duration_text(seconds)}（{seconds:.1f} 秒）\n"
-        f"退出码    : {exit_code}\n"
-        f"该程序累计: {same_count} 次，{duration_text(same_total)}\n"
-        f"全部累计  : {all_count} 次，{duration_text(all_total)}\n"
-    )
-    with record.open("a", encoding="utf-8") as handle:
-        handle.write(block)
-
-    return same_count, same_total, all_count, all_total
+def save_entries(record: Path, entries: dict[str, dict]) -> None:
+    """整份重写记录（先写临时文件再替换，避免写一半损坏）。"""
+    record.parent.mkdir(parents=True, exist_ok=True)
+    temp = record.with_name(record.name + ".tmp")
+    temp.write_text(render_entries(entries), encoding="utf-8-sig")
+    temp.replace(record)
 
 
 # ---------------------------------------------------------------- 交互输入
@@ -312,9 +365,8 @@ def main() -> int:
         if args.exe:
             exe = parse_exe(args.exe)
         else:
-            known = load_history(out_dir / RECORD_FILENAME)
-            last = Path(known[-1]["path"]) if known and known[-1]["path"] else None
-            exe, extra, chosen_dir = ask_exe(last)
+            known = load_entries(out_dir / RECORD_FILENAME)
+            exe, extra, chosen_dir = ask_exe(last_used(known))
     except (ValueError, FileNotFoundError) as exc:
         print(f"× {exc}")
         return 2
@@ -323,14 +375,14 @@ def main() -> int:
         out_dir = chosen_dir
 
     record = out_dir / RECORD_FILENAME
-    history = load_history(record)
+    entries = load_entries(record)
 
     check = args.check or "--check" in extra
     no_open = args.no_open or "--no-open" in extra
 
     if check:
         print(f"✓ 路径有效：{exe}")
-        print(f"  记录文件：{record}（已有 {len(history)} 条记录）")
+        print(f"  记录文件：{record}（已有 {len(entries)} 个程序记录）")
         print("  （--check：只检查，没有启动程序）")
         return 0
 
@@ -356,13 +408,12 @@ def main() -> int:
     ended = datetime.now()
     exit_code = normalize_exit_code(exit_code)
 
-    same_count, same_total, all_count, all_total = append_record(
-        record, exe, started, ended, seconds, exit_code, history
-    )
+    entry = record_run(entries, exe, started, ended, seconds)
+    save_entries(record, entries)
 
     print(f"程序已关闭：本次 {duration_text(seconds)}（退出码 {exit_code}）")
-    print(f"该程序第 {same_count} 次，累计 {duration_text(same_total)}")
-    print(f"已追加到：{record}")
+    print(f"该程序第 {entry['count']} 次，累计 {duration_text(entry['seconds'])}")
+    print(f"已更新：{record}")
 
     if not no_open:
         try:
