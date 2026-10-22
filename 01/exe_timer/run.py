@@ -17,8 +17,9 @@ from .common import (
     normalize_exit_code,
 )
 from .parse import parse_exe
-from .prompt import ask_exe
+from .prompt import ask_exe, ask_tag
 from .record import last_used, load_entries, record_run, save_entries
+from .tag_memory import load_tag_memory, save_tag_memory
 
 # 工作区根目录（exe_timer.py 所在位置），也是记录文件的默认存放位置。
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -68,6 +69,7 @@ def main() -> int:
     )
     parser.add_argument("exe", nargs="?", help=".exe 路径；省略则交互输入")
     parser.add_argument("-d", "--out-dir", help="记录文件所在目录，默认与脚本同目录")
+    parser.add_argument("--tag", help="标签（同标签的 exe 会合并累计）")
     parser.add_argument("--no-open", action="store_true", help="写完后不要自动用记事本打开")
     parser.add_argument("--check", action="store_true", help="只检查路径和记录文件，不启动程序")
     args = parser.parse_args()
@@ -97,11 +99,22 @@ def main() -> int:
 
     if check:
         print(f"✓ 路径有效：{exe}")
-        print(f"  记录文件：{record}（已有 {len(entries)} 个程序记录）")
+        print(f"  记录文件：{record}（已有 {len(entries)} 个标签）")
         print("  （--check：只检查，没有启动程序）")
         return 0
 
+    # ── 标签 ──
+    tag_mem = load_tag_memory(out_dir)
+    default_tag = args.tag or tag_mem.get(str(exe).lower(), exe.stem)
+
+    if args.tag:
+        tag = args.tag
+    else:
+        existing_tags = {e["tag"] for e in entries.values()}
+        tag = ask_tag(default_tag, existing_tags)
+
     print(f"程序：{exe}")
+    print(f"标签：{tag}")
     print("计时开始…（关闭程序自动停止；按 Space 暂停 / 继续）", flush=True)
 
     started = datetime.now()
@@ -121,11 +134,15 @@ def main() -> int:
     ended = datetime.now()
     exit_code = normalize_exit_code(exit_code)
 
-    entry = record_run(entries, exe, started, ended, seconds)
+    entry = record_run(entries, exe, tag, started, ended, seconds)
     save_entries(record, entries)
 
+    # 更新标签记忆
+    tag_mem[str(exe).lower()] = tag
+    save_tag_memory(out_dir, tag_mem)
+
     print(f"程序已关闭：本次 {duration_text(seconds)}（退出码 {exit_code}）")
-    print(f"该程序第 {entry['count']} 次，累计 {duration_text(entry['seconds'])}")
+    print(f"标签「{tag}」第 {entry['count']} 次，累计 {duration_text(entry['seconds'])}")
     print(f"已更新：{record}")
 
     if not no_open:

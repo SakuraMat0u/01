@@ -51,3 +51,16 @@ def ask_exe(default: Path | None) -> tuple[Path, set[str], Path | None]:
             return parse_exe(text), flags, chosen_dir
         except (ValueError, FileNotFoundError) as exc:
             print(f"  × {exc}，请重新输入（Ctrl+C 退出）")
+
+
+def ask_tag(default_tag: str, existing_tags: set[str]) -> str:
+    """交互式询问标签；直接回车用默认，输入新名字则创建 / 合并。"""
+    print(f"标签（直接回车 = {default_tag!r}）：")
+    if existing_tags:
+        print(f"已有标签：{', '.join(sorted(existing_tags))}")
+    try:
+        raw = input("> ").strip()
+    except EOFError:
+        print()
+        return default_tag
+    return raw if raw else default_tag
